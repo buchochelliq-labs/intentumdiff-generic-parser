@@ -41,6 +41,9 @@ fn language_info_for(ids: Vec<String>) -> Vec<LanguageInfoRecord> {
 
 struct GenericParser;
 
+/// One non-blank source row. `indent` is the UTF-8 byte column where the
+/// trimmed `text` starts in the raw row, so `indent + text.len()` is the byte
+/// column just past its last non-whitespace character.
 #[derive(Debug, Clone)]
 struct SourceLine {
     number: u32,
@@ -48,14 +51,20 @@ struct SourceLine {
     indent: u32,
 }
 
+impl SourceLine {
+    fn end_col(&self) -> u32 {
+        self.indent + self.text.len() as u32
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Block {
     node_type: String,
     label: String,
-    start_line: u32,
-    start_text: String,
+    signature: SourceLine,
     body: Vec<SourceLine>,
     end_line: u32,
+    end_col: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -68,8 +77,24 @@ fn clean_line(line: &str) -> String {
     line.trim().to_string()
 }
 
+/// Byte length of the leading whitespace (UTF-8 byte column of the first
+/// non-whitespace character), never a character count.
 fn line_indent(line: &str) -> u32 {
-    line.chars().take_while(|ch| ch.is_whitespace()).count() as u32
+    (line.len() - line.trim_start().len()) as u32
+}
+
+/// Rows of `source` split on LF only. A trailing CR (CRLF files) stays in the
+/// raw row; it is trimmed away from node text, so it never moves a column.
+fn source_rows(source: &str) -> impl Iterator<Item = &str> {
+    source.split('\n')
+}
+
+/// Exact end of source: row = number of LFs, column = UTF-8 byte length of
+/// the text after the last LF.
+fn source_end(source: &str) -> (u32, u32) {
+    let rows = source.bytes().filter(|b| *b == b'\n').count() as u32;
+    let last = source.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    (rows, (source.len() - last) as u32)
 }
 
 fn braces_delta(line: &str) -> i32 {
@@ -129,28 +154,29 @@ fn parse_items(source: &str) -> Vec<Item> {
     let mut current: Option<Block> = None;
     let mut depth: i32 = 0;
 
-    for (idx, raw_line) in source.lines().enumerate() {
+    for (idx, raw_line) in source_rows(source).enumerate() {
         let line_no = idx as u32;
         let trimmed = clean_line(raw_line);
         if trimmed.is_empty() {
             continue;
         }
+        let line = SourceLine {
+            number: line_no,
+            text: trimmed,
+            indent: line_indent(raw_line),
+        };
 
         if let Some(block) = current.as_mut() {
-            depth += braces_delta(&trimmed);
-            if depth <= 0 && trimmed == "}" {
-                block.end_line = line_no;
+            depth += braces_delta(&line.text);
+            block.end_line = line.number;
+            block.end_col = line.end_col();
+            if depth <= 0 && line.text == "}" {
                 items.push(Item::Block(block.clone()));
                 current = None;
                 depth = 0;
             } else {
-                block.body.push(SourceLine {
-                    number: line_no,
-                    text: trimmed,
-                    indent: line_indent(raw_line),
-                });
+                block.body.push(line);
                 if depth <= 0 {
-                    block.end_line = line_no;
                     items.push(Item::Block(block.clone()));
                     current = None;
                     depth = 0;
@@ -159,24 +185,20 @@ fn parse_items(source: &str) -> Vec<Item> {
             continue;
         }
 
-        let delta = braces_delta(&trimmed);
+        let delta = braces_delta(&line.text);
         if delta > 0 {
-            let (node_type, label) = block_kind_and_label(&trimmed);
+            let (node_type, label) = block_kind_and_label(&line.text);
             current = Some(Block {
                 node_type,
                 label,
-                start_line: line_no,
-                start_text: trimmed,
+                end_line: line.number,
+                end_col: line.end_col(),
+                signature: line,
                 body: Vec::new(),
-                end_line: line_no,
             });
             depth = delta;
         } else {
-            items.push(Item::Line(SourceLine {
-                number: line_no,
-                text: trimmed,
-                indent: line_indent(raw_line),
-            }));
+            items.push(Item::Line(line));
         }
     }
 
@@ -294,7 +316,7 @@ fn line_node(id: &str, line: &SourceLine) -> SemanticNode {
         line.number,
         line.indent,
         line.number,
-        line.indent + line.text.len() as u32,
+        line.end_col(),
         "",
     )
     .children(children)
@@ -302,12 +324,7 @@ fn line_node(id: &str, line: &SourceLine) -> SemanticNode {
 }
 
 fn block_node(id: &str, block: &Block) -> SemanticNode {
-    let signature = SourceLine {
-        number: block.start_line,
-        text: block.start_text.clone(),
-        indent: 0,
-    };
-    let mut children = vec![line_node(&format!("{}.0", id), &signature)];
+    let mut children = vec![line_node(&format!("{}.0", id), &block.signature)];
     for (index, line) in block.body.iter().enumerate() {
         children.push(line_node(&format!("{}.{}", id, index + 1), line));
     }
@@ -315,10 +332,10 @@ fn block_node(id: &str, block: &Block) -> SemanticNode {
         id,
         &block.node_type,
         &block.label,
-        block.start_line,
-        0,
+        block.signature.number,
+        block.signature.indent,
         block.end_line,
-        0,
+        block.end_col,
         "",
     )
     .children(children)
@@ -335,10 +352,19 @@ fn process_impl(source: &str) -> String {
             Item::Line(line) => line_node(&format!("0.{}", index), line),
         })
         .collect();
-    let end_line = source.lines().count() as u32;
-    let sem = SemanticNodeBuilder::new("0", "generic_file", "generic_file", 1, 0, end_line, 0, "")
-        .children(children)
-        .build();
+    let (end_row, end_col) = source_end(source);
+    let sem = SemanticNodeBuilder::new(
+        "0",
+        "generic_file",
+        "generic_file",
+        0,
+        0,
+        end_row,
+        end_col,
+        "",
+    )
+    .children(children)
+    .build();
     serde_json::to_string(&sem).unwrap_or_else(|e| format!(r#"{{"error":"Serialisation: {}"}}"#, e))
 }
 
@@ -452,5 +478,154 @@ mod tests {
             "expected generic example function label: {}",
             out
         );
+    }
+
+    // ---- Source-position contract (issue #4): 0-based rows, UTF-8 byte
+    // columns, root spans (0,0) to exact EOF, children inside parents. ----
+
+    fn rows(source: &str) -> Vec<&str> {
+        source.split('\n').collect()
+    }
+
+    fn pos(node: &serde_json::Value) -> (u64, u64, u64, u64) {
+        let p = &node["position"];
+        (
+            p["start_line"].as_u64().unwrap(),
+            p["start_col"].as_u64().unwrap(),
+            p["end_line"].as_u64().unwrap(),
+            p["end_col"].as_u64().unwrap(),
+        )
+    }
+
+    fn check_point(source: &str, row: u64, col: u64, what: &str) {
+        let rows = rows(source);
+        assert!(
+            (row as usize) < rows.len(),
+            "{what}: row {row} out of bounds"
+        );
+        let line = rows[row as usize];
+        assert!(col as usize <= line.len(), "{what}: col {col} past row end");
+        assert!(
+            line.is_char_boundary(col as usize),
+            "{what}: col {col} inside a UTF-8 sequence"
+        );
+    }
+
+    fn check_node(
+        source: &str,
+        node: &serde_json::Value,
+        parent: Option<(u64, u64, u64, u64)>,
+        ids: &mut std::collections::HashSet<String>,
+    ) {
+        let id = node["id"].as_str().unwrap().to_string();
+        assert!(ids.insert(id.clone()), "duplicate id {id}");
+        let (sr, sc, er, ec) = pos(node);
+        check_point(source, sr, sc, &format!("{id} start"));
+        check_point(source, er, ec, &format!("{id} end"));
+        assert!((sr, sc) <= (er, ec), "{id}: start after end");
+        if let Some((psr, psc, per, pec)) = parent {
+            assert!(
+                (psr, psc) <= (sr, sc) && (er, ec) <= (per, pec),
+                "{id}: child outside parent range"
+            );
+        }
+        for child in node["children"].as_array().unwrap() {
+            check_node(source, child, Some((sr, sc, er, ec)), ids);
+        }
+    }
+
+    fn tree(source: &str) -> serde_json::Value {
+        let out = process_impl(source);
+        t::assert_no_error(&out, "generic positions");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let mut ids = std::collections::HashSet::new();
+        check_node(source, &value, None, &mut ids);
+        value
+    }
+
+    fn root_span(source: &str) -> (u64, u64, u64, u64) {
+        pos(&tree(source))
+    }
+
+    #[test]
+    fn root_spans_exact_source_extent() {
+        assert_eq!(root_span(""), (0, 0, 0, 0));
+        assert_eq!(root_span("x = 1"), (0, 0, 0, 5));
+        assert_eq!(root_span("x = 1\n"), (0, 0, 1, 0));
+        assert_eq!(root_span("a\nb\n\n"), (0, 0, 3, 0));
+        assert_eq!(root_span("   \n  "), (0, 0, 1, 2));
+        assert_eq!(root_span("\u{2003}x = 1"), (0, 0, 0, 8));
+    }
+
+    #[test]
+    fn web_generic_incomplete_root_is_in_bounds() {
+        // Exact old/new pair of core's `web-generic-incomplete` assessment case.
+        let old = "The upload is accepted when (";
+        let new = "The upload is accepted unless (";
+        assert_eq!(root_span(old), (0, 0, 0, old.len() as u64));
+        assert_eq!(root_span(new), (0, 0, 0, new.len() as u64));
+    }
+
+    #[test]
+    fn multibyte_indentation_uses_byte_columns() {
+        // U+2003 EM SPACE is 3 UTF-8 bytes; issue #4 reproduction.
+        let value = tree("\u{2003}x = 1");
+        let stmt = &value["children"][0];
+        assert_eq!(stmt["label"], "x = 1");
+        assert_eq!(pos(stmt), (0, 3, 0, 8));
+        assert_eq!(pos(&stmt["children"][0]), (0, 3, 0, 4));
+        assert_eq!(pos(&stmt["children"][2]), (0, 7, 0, 8));
+    }
+
+    #[test]
+    fn multibyte_tokens_use_byte_columns() {
+        let value = tree("na\u{ef}ve = \"caf\u{e9}\" \u{2192} 1");
+        let tokens = value["children"][0]["children"].as_array().unwrap();
+        assert_eq!(tokens[0]["label"], "na\u{ef}ve");
+        assert_eq!(pos(&tokens[0]), (0, 0, 0, 6));
+        assert_eq!(pos(&tokens[2]), (0, 9, 0, 16));
+        assert_eq!(tokens[3]["label"], "\u{2192}");
+        assert_eq!(pos(&tokens[3]), (0, 17, 0, 20));
+    }
+
+    #[test]
+    fn crlf_rows_keep_cr_out_of_node_columns() {
+        // Convention: rows split on LF; a CR before LF is part of the raw row
+        // but never inside a node span. EOF column counts raw bytes.
+        let source = "a = 1\r\nb = 2\r\n";
+        let value = tree(source);
+        assert_eq!(pos(&value), (0, 0, 2, 0));
+        assert_eq!(pos(&value["children"][0]), (0, 0, 0, 5));
+        assert_eq!(pos(&value["children"][1]), (1, 0, 1, 5));
+        assert_eq!(root_span("a = 1\r"), (0, 0, 0, 6));
+    }
+
+    #[test]
+    fn adjacent_blocks_span_from_signature_to_closing_brace() {
+        let source = "  function f(x) {\n    return x\n  }\ncfg = {\n  a: 1\n}";
+        let value = tree(source);
+        let blocks = value["children"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["node_type"], "function_declaration");
+        assert_eq!(pos(&blocks[0]), (0, 2, 2, 3));
+        assert_eq!(pos(&blocks[0]["children"][0]), (0, 2, 0, 17));
+        assert_eq!(blocks[1]["node_type"], "object_declaration");
+        assert_eq!(pos(&blocks[1]), (3, 0, 5, 1));
+        assert_eq!(pos(&value), (0, 0, 5, 1));
+    }
+
+    #[test]
+    fn unclosed_block_ends_at_its_last_line() {
+        let value = tree("x = {\n  a: 1\n");
+        let block = &value["children"][0];
+        assert_eq!(pos(block), (0, 0, 1, 6));
+        assert_eq!(pos(&value), (0, 0, 2, 0));
+    }
+
+    #[test]
+    fn playground_example_positions_are_valid() {
+        let example = <GenericParser as Guest>::example("generic".to_string());
+        tree(&example.old);
+        tree(&example.new);
     }
 }
